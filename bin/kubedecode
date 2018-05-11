@@ -1,33 +1,81 @@
 #!/bin/bash
+set -euo pipefail
 
-function usage(){
-  echo -e "usage:      ${0} SECRET [NAMESPACE]\n"
-  echo -e "SECRET      The secret to decode"
-  echo -e "NAMESPACE   The namespace to retrieve the secret from (optional,"
-  echo -e "            defaults to the namespace of the current context)."
+all_namespaces=0
+namespace='default'
+
+while getopts ":han:" opt; do
+    case "${opt}" in
+        h)
+            usage
+            exit 0
+            ;;
+        a)
+            all_namespaces=1
+            ;;
+        n)
+            namespace=${OPTARG}
+            ;;
+        *)
+            usage
+            ;;
+    esac
+done
+shift $((OPTIND-1))
+
+function usage {
+  echo -e "usage:        ${0} [-n namespace] [secret]"
+  echo -e "-h:           this help"
+  echo -e "-a:           all namespaces"
+  echo -e "-n namespace: non-default namespace"
+  echo -e "secret:       The secret name to decode"
 }
 
-if [ "${1}" == "-h" ]; then
-  usage
-  exit
-fi
+function export_secret_with_type {
+  echo "kubectl create secret '${3}' '${2}' \\"
+  for row in $(kubectl get secrets "${2}" -o json -n "${1}" | jq -c '.data | to_entries[]'); do
+    key=$(echo "${row}" | jq -r '.key')
+    decoded=$(echo "${row}" | jq -r '.value' | base64 --decode)
+    echo "'--from-literal=${key}=${decoded}' \\"
+  done
+  echo "-n '${1}'"
+}
 
-if [[ -z "${1// }" ]]; then
-  echo "ERROR: No secret set."
-  usage
-  exit 1
-fi
-SECRET="$1"
+function export_secret {
+  secret_type=$(kubectl get secrets "${2}" -o json -n "${1}" | jq -cr '.type')
+  case "${secret_type}" in
+    Opaque)
+      export_secret_with_type "${1}" "${2}" 'generic'
+      ;;
+    kubernetes.io/tls)
+      export_secret_with_type "${1}" "${2}" 'tls'
+      ;;
+    *)
+      echo "#Skipping ${secret_type} secret '${1}/${2}'"
+  esac
+  echo
+  return 0
+}
 
-if [[ -z "${2// }" ]]; then
-  NAMESPACE=$(kubectl config get-contexts --no-headers | tr -s ' ' | cut -d ' ' -f5)
-  echo "No namespace set, using default: ${NAMESPACE}"
-else
-  NAMESPACE="$2"
-fi
+function export_namespace_secrets {
+  echo "# Running on namespace '${1}'"
+  echo
+  for name in $(kubectl get secrets -o json -n "${1}" | jq -cr .items[].metadata.name); do
+    export_secret "${1}" "$name"
+  done
+}
 
-for row in $(kubectl get secret "${SECRET}" -o json -n "${NAMESPACE}" | jq -c '.data | to_entries[]'); do
-  KEY=$(echo "${row}" | jq -r '.key')
-  DECODED=$(echo "${row}" | jq -r '.value' | base64 --decode)
-  echo "${KEY}: ${DECODED}"
+function export_all_namespaces {
+  for name in $(kubectl get ns -o json | jq -cr .items[].metadata.name); do
+    export_namespace_secrets "$name"
+  done
+}
+
+[ "$all_namespaces" -eq 1 ] && export_all_namespaces && exit 0
+
+[ "$#" -eq 0 ] && export_namespace_secrets "${namespace}" && exit 0
+
+for secret in "$@"
+do
+  export_secret "${namespace}" "$secret"
 done
